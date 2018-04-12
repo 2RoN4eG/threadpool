@@ -3,26 +3,44 @@
 
 #include <functional>
 #include <thread>
-#include <queue>
 #include <mutex>
 #include <memory>
+#include <vector>
 #include <condition_variable>
+
+#include <Worker.h>
+
+#define VERSION_1
 
 template <class TResult>
 struct Task
 {
-    bool        _ready;
-    TResult     _result;
+// #ifdef VERSION_1
+    std::mutex                  _mutex;
+    std::condition_variable     _cv;
+// #endif // VERSION_1
+
+    TResult                     _result;
+
+    bool                        _ready      = false;
+
+    unsigned int                _workerId   = 0;
 
 public:
-    Task ():
-        _ready (false)
-    {
-    }
+    Task () = default;
 
     TResult Result ()
     {
-        ///
+        std::unique_lock <std::mutex> locker (_mutex);
+
+        std::cout << "Worker ID "
+                  << _workerId
+                  << " waiting result" << std::endl;
+
+        if (_ready == false)
+        {
+            _cv.wait (locker, [&] (){ return _ready == false; });
+        }
 
         return _result;
     }
@@ -30,86 +48,11 @@ public:
 
 class ThreadPool
 {
+    typedef std::shared_ptr <Worker> WorkerPointer;
+
+    std::vector <WorkerPointer> _workers;
+
 public:
-    class Worker
-    {
-    public:
-        typedef std::function <void ()> TFunction;
-
-    public:
-        Worker () :
-            _enabled (true),
-            _functions (),
-            _thread (&Worker::ThreadFunction, this)
-        {
-        }
-
-        ~Worker ()
-        {
-            _enabled = false;
-            _cv.notify_one ();
-            _thread.join ();
-        }
-
-        void Append (TFunction funtion)
-        {
-            std::unique_lock <std::mutex> locker (_mutex);
-
-            _functions.push (funtion);
-
-            _cv.notify_one ();
-        }
-
-        size_t TaskCount ()
-        {
-            std::unique_lock <std::mutex> locker (_mutex);
-
-            return _functions.size ();
-        }
-
-        bool IsEmpty ()
-        {
-            std::unique_lock <std::mutex> locker (_mutex);
-
-            return _functions.empty ();
-        }
-
-    private:
-
-        bool                        _enabled;
-        std::condition_variable     _cv;
-        std::queue <TFunction>		_functions;
-        std::mutex                  _mutex;
-        std::thread                 _thread;
-
-        void ThreadFunction ()
-        {
-            while (_enabled)
-            {
-                std::unique_lock <std::mutex> locker (_mutex);
-                // Îæèäàåì óâåäîìëåíèÿ, è óáåäèìñÿ ÷òî ýòî íå ëîæíîå ïðîáóæäåíèå
-                // Ïîòîê äîëæåí ïðîñíóòüñÿ åñëè î÷åðåäü íå ïóñòàÿ ëèáî îí âûêëþ÷åí
-
-                _cv.wait (locker, [&] (){ return !_functions.empty () || !_enabled; });
-
-                while (!_functions.empty ())
-                {
-                    TFunction function = _functions.front ();
-
-                    // Ðàçáëîêèðóåì ìþòåêñ ïåðåä âûçîâîì ôóíêòîðà
-                    locker.unlock ();
-
-                    function ();
-
-                    // Âîçâðàùàåì áëîêèðîâêó ñíîâà ïåðåä âûçîâîì fqueue.empty ()
-                    locker.lock ();
-
-                    _functions.pop ();
-                }
-            }
-        }
-    };
-
     ThreadPool (size_t threads = 8)
     {
         while (threads -- > 0)
@@ -120,8 +63,6 @@ public:
         }
     }
 
-    ~ThreadPool () {}
-
     template <class TResult, class TFunction, class... TArguments>
     std::shared_ptr <Task <TResult>> RunAsync (TFunction function, TArguments... arguments)
     {
@@ -131,10 +72,30 @@ public:
 
         worker->Append ([=] ()
         {
+#ifndef VERSION_1
             std::function <TResult ()> _function = std::bind (function, arguments...);
 
-            task->_result   = _function ();
-            task->_ready    = true;
+
+            task->_result = _function ();
+            task->_ready  = true;
+#endif // VERSION_1
+
+#ifdef VERSION_1
+            std::function <TResult ()> _function = std::bind (function, arguments...);
+
+            std::cout << "Function ended" << std::endl;
+
+            TResult result = _function ();
+
+            {
+                std::unique_lock <std::mutex> locker (task->_mutex);
+
+                task->_result   = result;
+                task->_ready    = true;
+            }
+
+            task->_cv.notify_one ();
+#endif // VERSION_1
         });
 
         return task;
@@ -169,11 +130,6 @@ private:
 
         return worker;
     }
-
-private:
-    typedef std::shared_ptr <Worker> WorkerPointer;
-
-    std::vector <WorkerPointer> _workers;
 };
 
 #endif // THREADPOOL_H
